@@ -8,6 +8,7 @@ import multiprocessing as mp
 from queue import Empty, Full
 from PIL import Image
 import gradio as gr
+import torch
 from trustmark import TrustMark
 
 # 环境清理
@@ -17,18 +18,65 @@ os.environ.pop('https_proxy', None)
 logging.getLogger("PIL").setLevel(logging.WARNING)
 
 
-MODEL_TYPE = "Q"
+# MODEL_TYPE = "Q"  # Now dynamically selected by user
+# ============================
+# Device and Model Discovery
+# ============================
+
+def discover_devices():
+    """
+    Discover available compute devices (CPU and CUDA GPUs).
+    Returns list of tuples: (display_label, device_string)
+    """
+    devices = []
+    
+    # CPU always available
+    devices.append(("CPU", "cpu"))
+    
+    # Check for CUDA devices
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            name = torch.cuda.get_device_name(i)
+            props = torch.cuda.get_device_properties(i)
+            memory_gb = props.total_memory / (1024**3)
+            compute_capability = f"{props.major}.{props.minor}"
+            label = f"cuda:{i} - {name} ({memory_gb:.1f}GB, Compute {compute_capability})"
+            devices.append((label, f"cuda:{i}"))
+    
+    return devices
+
+def get_default_device():
+    """
+    Returns the default device string.
+    Prefers first CUDA device if available, otherwise CPU.
+    """
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        return "cuda:0"
+    return "cpu"
+
+def get_model_types():
+    """
+    Returns list of available model types with descriptions.
+    Format: (display_label, model_code)
+    """
+    return [
+        ("Q - Balanced (PSNR ~43, ResNet50) [Default]", "Q"),
+        ("P - High Quality (PSNR ~48)", "P"),
+        ("C - Compact (PSNR ~39, ResNet18)", "C"),
+        ("B - High Robustness (PSNR ~43)", "B")
+    ]
+
 # ============================
 # 单进程编码
 # ============================
 
-def encode_video_sp(video_path, wm_secret):
+def encode_video_sp(video_path, wm_secret, device, model_type):
     if not video_path:
         return None
 
     if not video_path:
         return None    
-    tm = TrustMark(verbose=False, model_type=MODEL_TYPE)
+    tm = TrustMark(verbose=False, model_type=model_type, device=device)
     wm_secret = int(wm_secret)
     print(f"Encoding secret: {wm_secret}")
     cap = cv2.VideoCapture(video_path)
@@ -67,14 +115,14 @@ def encode_video_sp(video_path, wm_secret):
 # ============================
 # 多进程编码
 # ============================
-def watermark_worker(in_q, out_q, bits_str):
+def watermark_worker(in_q, out_q, bits_str, device, model_type):
     """
     独立进程：负责加载模型并进行编码
     """
     try:
         from trustmark import TrustMark
         # 在进程内初始化，避免 CUDA 句柄跨进程共享冲突
-        tm_worker = TrustMark(verbose=False, model_type=MODEL_TYPE)
+        tm_worker = TrustMark(verbose=False, model_type=model_type, device=device)
         
         while True:
             try:
@@ -103,7 +151,7 @@ def watermark_worker(in_q, out_q, bits_str):
 # ============================
 # Encode Logic (Multi-process)
 # ============================
-def encode_video(video_path, wm_secret_val):
+def encode_video(video_path, wm_secret_val, device, model_type):
     if not video_path:
         return None
 
@@ -136,7 +184,7 @@ def encode_video(video_path, wm_secret_val):
     workers = []
 
     for _ in range(num_workers):
-        p = mp.Process(target=watermark_worker, args=(in_q, out_q, bits_str))
+        p = mp.Process(target=watermark_worker, args=(in_q, out_q, bits_str, device, model_type))
         p.start()
         workers.append(p)
 
@@ -192,9 +240,9 @@ def encode_video(video_path, wm_secret_val):
 # Decode Logic (保持单进程即可，解码通常较快)
 # ============================
 # 注意：为了避免主进程预加载模型占用 worker 显存，建议在函数内部初始化 tm
-def decode_video_watermark(video_path):
+def decode_video_watermark(video_path, device, model_type):
     from trustmark import TrustMark
-    tm_decoder = TrustMark(verbose=False, model_type=MODEL_TYPE)
+    tm_decoder = TrustMark(verbose=False, model_type=model_type, device=device)
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -240,6 +288,85 @@ def secret_to_bits(secret_str):
 def launch_app():
     with gr.Blocks(title="Video Watermark Tool") as demo:
         gr.Markdown("## 🎥 Video Watermark Encoder (Multi-Process)")
+        
+        # Settings Section - Universal Configuration
+        gr.Markdown("### ⚙️ Configuration")
+        
+        with gr.Row():
+            with gr.Column(scale=1):
+                # Discover devices and get default
+                available_devices = discover_devices()
+                device_labels = [d[0] for d in available_devices]
+                device_values = [d[1] for d in available_devices]
+                default_device_value = get_default_device()
+                default_device_index = device_values.index(default_device_value) if default_device_value in device_values else 0
+                
+                device_selector = gr.Dropdown(
+                    choices=device_labels,
+                    value=device_labels[default_device_index],
+                    label="Compute Device",
+                    info="Select device for inference"
+                )
+                
+                # Hidden state to store actual device string (cuda:0, cpu, etc.)
+                device_state = gr.State(value=default_device_value)
+                
+            with gr.Column(scale=1):
+                # Model type selection
+                model_choices = get_model_types()
+                model_labels = [m[0] for m in model_choices]
+                model_values = [m[1] for m in model_choices]
+                default_model_index = model_values.index("Q")
+                
+                model_selector = gr.Dropdown(
+                    choices=model_labels,
+                    value=model_labels[default_model_index],
+                    label="Model Type",
+                    info="Select TrustMark model variant"
+                )
+                
+                # Hidden state to store actual model code (Q, P, C, B)
+                model_state = gr.State(value="Q")
+        
+        # Device info display
+        device_info = gr.Textbox(
+            label="Current Configuration",
+            value=f"Device: {device_labels[default_device_index]} | Model: Q - Balanced (PSNR ~43, ResNet50) [Default]",
+            interactive=False,
+            lines=1
+        )
+        
+        gr.Markdown("---")  # Visual separator
+        
+        # Update states when selections change
+        def update_device_state(selected_label):
+            # Find the device value corresponding to selected label
+            for label, value in available_devices:
+                if label == selected_label:
+                    return value, f"Device: {selected_label} | Model: {model_state.value}"
+            return device_state.value, device_info.value
+        
+        def update_model_state(selected_label):
+            # Find the model value corresponding to selected label
+            for label, value in model_choices:
+                if label == selected_label:
+                    return value, f"Device: {device_selector.value} | Model: {selected_label}"
+            return model_state.value, device_info.value
+        
+        def update_device_info(device_label, model_label):
+            return f"Device: {device_label} | Model: {model_label}"
+        
+        device_selector.change(
+            fn=update_device_state,
+            inputs=[device_selector],
+            outputs=[device_state, device_info]
+        )
+        
+        model_selector.change(
+            fn=update_model_state,
+            inputs=[model_selector],
+            outputs=[model_state, device_info]
+        )
 
         with gr.Tabs():
             
@@ -252,7 +379,7 @@ def launch_app():
                 
                 output_video = gr.Video(label="Output")
                 encode_btn = gr.Button("Start Single-process Encoding")
-                encode_btn.click(fn=encode_video_sp, inputs=[input_video, wm_secret], outputs=output_video)            
+                encode_btn.click(fn=encode_video_sp, inputs=[input_video, wm_secret, device_state, model_state], outputs=output_video)            
             
             
             
@@ -265,13 +392,13 @@ def launch_app():
                 
                 output_video = gr.Video(label="Output")
                 encode_btn = gr.Button("Start Multi-process Encoding")
-                encode_btn.click(fn=encode_video, inputs=[input_video, wm_secret], outputs=output_video)
+                encode_btn.click(fn=encode_video, inputs=[input_video, wm_secret, device_state, model_state], outputs=output_video)
   
             with gr.Tab("🔓 Decode"):
                 video_input = gr.Video()
                 output_log = gr.Textbox(label="Log", lines=15)
                 decode_btn = gr.Button("Decode")
-                decode_btn.click(fn=decode_video_watermark, inputs=video_input, outputs=output_log)
+                decode_btn.click(fn=decode_video_watermark, inputs=[video_input, device_state, model_state], outputs=output_log)
 
     demo.launch(server_name="0.0.0.0", server_port=7860)
 
