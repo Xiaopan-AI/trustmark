@@ -185,7 +185,15 @@ class TrustMark():
             config.params.noise_config.target = 'trustmark.model.Identity'
     
         model = instantiate_from_config(config)
-        state_dict = torch.load(weight_path, map_location=torch.device('cpu'))
+        try:
+            state_dict = torch.load(
+                weight_path,
+                map_location=torch.device('cpu'),
+                weights_only=True,
+            )
+        except TypeError:
+            # Backward compatibility for older torch versions
+            state_dict = torch.load(weight_path, map_location=torch.device('cpu'))
         
         if 'global_step' in state_dict:
             print(f'Global step: {state_dict["global_step"]}, epoch: {state_dict["epoch"]}')

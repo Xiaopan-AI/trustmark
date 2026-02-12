@@ -10,6 +10,7 @@ from PIL import Image
 import gradio as gr
 import torch
 from trustmark import TrustMark
+from live_stream_backend import stream_manager, build_hls_player_html
 
 # 环境清理
 os.environ.pop('http_proxy', None)
@@ -163,8 +164,8 @@ def get_model_types():
     Format: (display_label, model_code)
     """
     return [
-        ("Q - Balanced (PSNR ~43, ResNet50) [Default]", "Q"),
-        ("P - High Quality (PSNR ~48)", "P"),
+        ("P - High Quality (PSNR ~48) [Default]", "P"),
+        ("Q - Balanced (PSNR ~43, ResNet50)", "Q"),
         ("C - Compact (PSNR ~39, ResNet18)", "C"),
         ("B - High Robustness (PSNR ~43)", "B")
     ]
@@ -495,7 +496,7 @@ def launch_app():
                 model_choices = get_model_types()
                 model_labels = [m[0] for m in model_choices]
                 model_values = [m[1] for m in model_choices]
-                default_model_index = model_values.index("Q")
+                default_model_index = model_values.index("P")
                 
                 model_selector = gr.Dropdown(
                     choices=model_labels,
@@ -505,12 +506,12 @@ def launch_app():
                 )
                 
                 # Hidden state to store actual model code (Q, P, C, B)
-                model_state = gr.State(value="Q")
+                model_state = gr.State(value="P")
         
         # Device info display
         device_info = gr.Textbox(
             label="Current Configuration",
-            value=f"Device: {device_labels[default_device_index]} | Model: Q - Balanced (PSNR ~43, ResNet50) [Default]",
+            value=f"Device: {device_labels[default_device_index]} | Model: P - High Quality (PSNR ~48) [Default]",
             interactive=False,
             lines=1
         )
@@ -534,6 +535,256 @@ def launch_app():
         
         def update_device_info(device_label, model_label):
             return f"Device: {device_label} | Model: {model_label}"
+
+        def _extract_video_path(video_value):
+            if isinstance(video_value, str):
+                return video_value
+            if isinstance(video_value, dict):
+                return video_value.get("path") or video_value.get("name")
+            return None
+
+        live_ui_cache = {
+            "job_id": "",
+            "status": "",
+            "progress": "",
+            "probe_log": "",
+            "last_ui_push_ts": 0.0,
+        }
+
+        def start_live_encode(
+            video_value,
+            wm_secret,
+            device,
+            model_type,
+            prebuffer_s,
+            segment_s,
+            gpu_batch_target,
+            gpu_batch_max,
+            gpu_flush_ms,
+            use_nvenc,
+            decode_mode,
+            decode_workers,
+            inference_scale,
+        ):
+            video_path = _extract_video_path(video_value)
+            if not video_path:
+                status_txt = "ERROR"
+                progress_txt = "Please upload a source video."
+                probe_txt = "Probe idle"
+                live_ui_cache["job_id"] = ""
+                live_ui_cache["status"] = status_txt
+                live_ui_cache["progress"] = progress_txt
+                live_ui_cache["probe_log"] = probe_txt
+                live_ui_cache["last_ui_push_ts"] = time.time()
+                return "", status_txt, progress_txt, "<div>No stream.</div>", "", probe_txt
+            try:
+                job_id = stream_manager.start_job(
+                    video_path=video_path,
+                    wm_secret=wm_secret,
+                    device=device,
+                    model_type=model_type,
+                    prebuffer_seconds=int(prebuffer_s),
+                    segment_seconds=int(segment_s),
+                    gpu_batch_target=int(gpu_batch_target),
+                    gpu_batch_max=int(gpu_batch_max),
+                    gpu_flush_ms=int(gpu_flush_ms),
+                    use_nvenc=bool(use_nvenc),
+                    decode_mode=str(decode_mode),
+                    decode_workers=int(decode_workers),
+                    inference_scale=float(inference_scale),
+                )
+                status_txt = "BUFFERING"
+                progress_txt = "Job created. Preparing stream buffer..."
+                probe_txt = "Probe idle"
+                live_ui_cache["job_id"] = job_id
+                live_ui_cache["status"] = status_txt
+                live_ui_cache["progress"] = progress_txt
+                live_ui_cache["probe_log"] = probe_txt
+                live_ui_cache["last_ui_push_ts"] = time.time()
+                return job_id, status_txt, progress_txt, "<div>Buffering stream...</div>", "", probe_txt
+            except Exception as e:
+                status_txt = "ERROR"
+                progress_txt = str(e)
+                probe_txt = f"Probe error: {e}"
+                live_ui_cache["job_id"] = ""
+                live_ui_cache["status"] = status_txt
+                live_ui_cache["progress"] = progress_txt
+                live_ui_cache["probe_log"] = probe_txt
+                live_ui_cache["last_ui_push_ts"] = time.time()
+                return "", status_txt, progress_txt, "<div>Failed to start stream.</div>", "", probe_txt
+
+        def poll_live_encode(
+            job_id,
+            rendered_playlist_url=None,
+        ):
+            last_status = live_ui_cache["status"]
+            last_progress = live_ui_cache["progress"]
+            last_probe_log = live_ui_cache["probe_log"]
+            last_ui_push_ts = live_ui_cache["last_ui_push_ts"]
+            if not job_id:
+                status_txt = "IDLE"
+                progress_txt = "No active job."
+                probe_txt = "Probe idle"
+                status_out = status_txt if status_txt != last_status else gr.update()
+                progress_out = progress_txt if progress_txt != last_progress else gr.update()
+                probe_out = probe_txt if probe_txt != last_probe_log else gr.update()
+                live_ui_cache["job_id"] = ""
+                live_ui_cache["status"] = status_txt
+                live_ui_cache["progress"] = progress_txt
+                live_ui_cache["probe_log"] = probe_txt
+                return status_out, progress_out, "<div>Waiting for stream...</div>", "", probe_out
+            status = stream_manager.get_status(job_id)
+            if not status.get("exists"):
+                status_txt = "NOT_FOUND"
+                progress_txt = "Job not found."
+                probe_txt = "Probe idle"
+                status_out = status_txt if status_txt != last_status else gr.update()
+                progress_out = progress_txt if progress_txt != last_progress else gr.update()
+                probe_out = probe_txt if probe_txt != last_probe_log else gr.update()
+                live_ui_cache["status"] = status_txt
+                live_ui_cache["progress"] = progress_txt
+                live_ui_cache["probe_log"] = probe_txt
+                return status_out, progress_out, "<div>Stream unavailable.</div>", "", probe_out
+
+            state = status.get("state", "UNKNOWN")
+            total = status.get("total_frames", 0)
+            processed = status.get("frames_processed", 0)
+            segs = status.get("segments_written", 0)
+            batch_target = status.get("gpu_batch_target", 0)
+            batch_max = status.get("gpu_batch_max", 0)
+            batch_avg = status.get("avg_batch_size", 0.0)
+            flush_ms = status.get("gpu_flush_ms", 0)
+            backend = status.get("encoder_backend", "unknown")
+            decode_mode = status.get("decode_mode", "auto")
+            decode_workers = status.get("decode_workers", 1)
+            decode_q = status.get("decode_q_depth", 0)
+            encoded_q = status.get("encoded_q_depth", 0)
+            ff_q = status.get("ffmpeg_q_depth", 0)
+            reorder_sz = status.get("reorder_buffer_size", 0)
+            dec_fps = status.get("decode_fps", 0.0)
+            gpu_fps = status.get("gpu_encode_fps", 0.0)
+            wr_fps = status.get("writer_fps", 0.0)
+            starve_pct = status.get("gpu_starvation_pct", 0.0)
+            decoder_fps_list = status.get("decoder_fps_list", "")
+            dropped = status.get("dropped_frames", 0)
+            decode_backend = status.get("decode_backend", "unknown")
+            read_ms = status.get("avg_frame_read_ms", 0.0)
+            inference_scale = status.get("inference_scale", 1.0)
+            t_decode_q = status.get("avg_decode_enqueue_ms", 0.0)
+            t_gpu_infer = status.get("avg_gpu_batch_infer_ms", 0.0)
+            t_gpu_emit = status.get("avg_gpu_batch_emit_ms", 0.0)
+            t_reorder_q = status.get("avg_reorder_enqueue_ms", 0.0)
+            t_write = status.get("avg_writer_write_ms", 0.0)
+            warn = status.get("warnings", "")
+            probe_latest = status.get("probe_latest", "Probe idle")
+            probe_log = status.get("probe_log", "Probe idle")
+            if total and total > 0:
+                progress = (
+                    f"{processed}/{total} frames | seg={segs} | enc={backend} | "
+                    f"fps(d/g/w)={dec_fps:.1f}/{gpu_fps:.1f}/{wr_fps:.1f} | "
+                    f"decode={decode_mode}:{decode_workers}w ({decode_backend}, {read_ms:.2f}ms, {decoder_fps_list}) | "
+                    f"inf_scale={inference_scale:.2f} | "
+                    f"timers[ms] dq={t_decode_q:.3f} ginf={t_gpu_infer:.3f} gemit={t_gpu_emit:.3f} rq={t_reorder_q:.3f} wr={t_write:.3f} | "
+                    f"batch(t/m/avg)={batch_target}/{batch_max}/{batch_avg:.1f} flush={flush_ms}ms | "
+                    f"q(d/e/f)={decode_q}/{encoded_q}/{ff_q} reorder={reorder_sz} | "
+                    f"gpu_starve={starve_pct:.1f}% dropped={dropped}"
+                )
+            else:
+                progress = (
+                    f"{processed} frames | seg={segs} | enc={backend} | "
+                    f"fps(d/g/w)={dec_fps:.1f}/{gpu_fps:.1f}/{wr_fps:.1f} | "
+                    f"decode={decode_mode}:{decode_workers}w ({decode_backend}, {read_ms:.2f}ms, {decoder_fps_list}) | "
+                    f"inf_scale={inference_scale:.2f} | "
+                    f"timers[ms] dq={t_decode_q:.3f} ginf={t_gpu_infer:.3f} gemit={t_gpu_emit:.3f} rq={t_reorder_q:.3f} wr={t_write:.3f} | "
+                    f"batch(t/m/avg)={batch_target}/{batch_max}/{batch_avg:.1f} flush={flush_ms}ms | "
+                    f"q(d/e/f)={decode_q}/{encoded_q}/{ff_q} reorder={reorder_sz} | "
+                    f"gpu_starve={starve_pct:.1f}% dropped={dropped}"
+                )
+            if warn:
+                progress = f"{progress} | note={warn}"
+
+            # Lightweight bottleneck hint from telemetry
+            hint = ""
+            if state in ("BUFFERING", "STREAMING", "DONE"):
+                if starve_pct > 30.0 and decode_q < max(4, batch_target // 2):
+                    hint = "Hint: DECODE_BOUND -> try Decode Mode=ffmpeg_pipe, raise Decode Workers, lower GPU Batch Target."
+                elif ff_q > 64 and wr_fps < gpu_fps * 0.8:
+                    hint = "Hint: WRITER_BOUND -> enable NVENC, lower segment seconds, reduce GPU Batch Max slightly."
+                elif decode_q > 64 and starve_pct < 10.0 and gpu_fps < dec_fps * 0.8:
+                    hint = "Hint: GPU_BOUND -> raise GPU Batch Target/Max and reduce GPU Flush(ms)."
+                elif reorder_sz > 64:
+                    hint = "Hint: REORDER_BACKLOG -> reduce Decode Workers or lower batch settings."
+                else:
+                    hint = "Hint: BALANCED -> fine tune one knob at a time."
+            if hint:
+                progress = f"{progress} | {hint}"
+
+            if state in ("STREAMING", "DONE"):
+                player_url = status.get("player_url", "")
+                if player_url and player_url != rendered_playlist_url:
+                    html = build_hls_player_html(player_url)
+                    status_txt = state
+                    progress_txt = f"{progress} | probe={probe_latest}"
+                    probe_txt = probe_log
+                    status_out = status_txt if status_txt != last_status else gr.update()
+                    progress_out = progress_txt if progress_txt != last_progress else gr.update()
+                    probe_out = probe_txt if probe_txt != last_probe_log else gr.update()
+                    live_ui_cache["status"] = status_txt
+                    live_ui_cache["progress"] = progress_txt
+                    live_ui_cache["probe_log"] = probe_txt
+                    live_ui_cache["last_ui_push_ts"] = time.time()
+                    return status_out, progress_out, html, player_url, probe_out
+                html = gr.update()
+            elif state == "ERROR":
+                html = f"<div>Stream error: {status.get('error', 'Unknown error')}</div>"
+                status_txt = state
+                progress_txt = f"{progress} | probe={probe_latest}"
+                probe_txt = probe_log
+                status_out = status_txt if status_txt != last_status else gr.update()
+                progress_out = progress_txt if progress_txt != last_progress else gr.update()
+                probe_out = probe_txt if probe_txt != last_probe_log else gr.update()
+                live_ui_cache["status"] = status_txt
+                live_ui_cache["progress"] = progress_txt
+                live_ui_cache["probe_log"] = probe_txt
+                live_ui_cache["last_ui_push_ts"] = time.time()
+                return status_out, progress_out, html, rendered_playlist_url, probe_out
+            elif state == "STOPPED":
+                html = "<div>Stream stopped.</div>"
+                status_txt = state
+                progress_txt = f"{progress} | probe={probe_latest}"
+                probe_txt = probe_log
+                status_out = status_txt if status_txt != last_status else gr.update()
+                progress_out = progress_txt if progress_txt != last_progress else gr.update()
+                probe_out = probe_txt if probe_txt != last_probe_log else gr.update()
+                live_ui_cache["status"] = status_txt
+                live_ui_cache["progress"] = progress_txt
+                live_ui_cache["probe_log"] = probe_txt
+                live_ui_cache["last_ui_push_ts"] = time.time()
+                return status_out, progress_out, html, "", probe_out
+            else:
+                html = "<div>Buffering stream...</div>"
+            status_txt = state
+            progress_txt = f"{progress} | probe={probe_latest}"
+            probe_txt = probe_log
+            now_ts = time.time()
+            should_push = (state != last_status) or ((now_ts - float(last_ui_push_ts or 0.0)) >= 5.0)
+            status_out = status_txt if (should_push and status_txt != last_status) else gr.update()
+            progress_out = progress_txt if (should_push and progress_txt != last_progress) else gr.update()
+            probe_out = probe_txt if (should_push and probe_txt != last_probe_log) else gr.update()
+            live_ui_cache["status"] = status_txt
+            live_ui_cache["progress"] = progress_txt
+            live_ui_cache["probe_log"] = probe_txt
+            if should_push:
+                live_ui_cache["last_ui_push_ts"] = now_ts
+            return status_out, progress_out, html, rendered_playlist_url, probe_out
+
+        def stop_live_encode(job_id):
+            if not job_id:
+                return "IDLE", "No active job."
+            ok = stream_manager.stop_job(job_id)
+            if ok:
+                return "STOPPED", "Stop signal sent."
+            return "NOT_FOUND", "Job not found."
         
         device_selector.change(
             fn=update_device_state,
@@ -578,6 +829,102 @@ def launch_app():
                 output_log = gr.Textbox(label="Log", lines=15)
                 decode_btn = gr.Button("Decode")
                 decode_btn.click(fn=decode_video_watermark, inputs=[video_input, device_state, model_state], outputs=output_log)
+
+            with gr.Tab("⚡ Live Encode"):
+                live_input_video = gr.Video(label="Input Video")
+                live_secret = gr.Textbox(label="Secret (Int)")
+                with gr.Accordion("Tuning Settings", open=False):
+                    with gr.Row():
+                        prebuffer_seconds = gr.Slider(minimum=2, maximum=12, value=4, step=1, label="Prebuffer Seconds")
+                        segment_seconds = gr.Slider(minimum=1, maximum=4, value=2, step=1, label="HLS Segment Seconds")
+                    with gr.Row():
+                        live_gpu_batch_target = gr.Slider(minimum=1, maximum=64, value=60, step=1, label="GPU Batch Target")
+                        live_gpu_batch_max = gr.Slider(minimum=1, maximum=64, value=64, step=1, label="GPU Batch Max")
+                        live_gpu_flush_ms = gr.Slider(minimum=1, maximum=100, value=12, step=1, label="GPU Flush (ms)")
+                        live_use_nvenc = gr.Checkbox(value=True, label="Use NVENC Hardware Encoder")
+                    with gr.Row():
+                        live_decode_mode = gr.Dropdown(
+                            choices=["auto", "single_opencv", "ffmpeg_pipe"],
+                            value="auto",
+                            label="Decode Mode",
+                        )
+                        live_decode_workers = gr.Slider(minimum=1, maximum=8, value=2, step=1, label="Decode Workers")
+                        live_inference_scale = gr.Dropdown(
+                            choices=["1.0", "0.75", "0.5"],
+                            value="0.5",
+                            label="Inference Scale",
+                        )
+                    gr.Markdown(
+                        "### Tuning pointers\n"
+                        "- `Decode Mode`: start with `auto`; force `ffmpeg_pipe` for higher decode throughput.\n"
+                        "- `Decode Workers`: increase only if decode seems behind; too high may add overhead.\n"
+                        "- `GPU Batch Target/Max`: increase for throughput, decrease if latency/reorder grows.\n"
+                        "- `GPU Flush (ms)`: lower for responsiveness, higher for larger effective batches.\n"
+                        "- `Use NVENC`: keep enabled to reduce writer bottleneck.\n"
+                        "- Read telemetry: if `gpu_starve` is high and `decode_q` stays low, decode is the bottleneck."
+                    )
+                with gr.Row():
+                    live_start_btn = gr.Button("Start Live Encode Stream")
+                    live_stop_btn = gr.Button("Stop Stream")
+                live_job_id = gr.Textbox(label="Job ID", interactive=False)
+                live_status = gr.Textbox(label="Status", interactive=False)
+                live_progress = gr.Textbox(label="Progress", interactive=False)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        live_player = gr.HTML(label="Live Stream")
+                    with gr.Column(scale=2):
+                        live_probe_log = gr.Textbox(
+                            label="Watermark Probe Log",
+                            lines=20,
+                            max_lines=20,
+                            interactive=False,
+                        )
+                live_rendered_playlist_url = gr.State(value="")
+
+                live_start_btn.click(
+                    fn=start_live_encode,
+                    inputs=[
+                        live_input_video,
+                        live_secret,
+                        device_state,
+                        model_state,
+                        prebuffer_seconds,
+                        segment_seconds,
+                        live_gpu_batch_target,
+                        live_gpu_batch_max,
+                        live_gpu_flush_ms,
+                        live_use_nvenc,
+                        live_decode_mode,
+                        live_decode_workers,
+                        live_inference_scale,
+                    ],
+                    outputs=[
+                        live_job_id,
+                        live_status,
+                        live_progress,
+                        live_player,
+                        live_rendered_playlist_url,
+                        live_probe_log,
+                    ],
+                )
+                live_stop_btn.click(
+                    fn=stop_live_encode,
+                    inputs=[live_job_id],
+                    outputs=[live_status, live_progress],
+                )
+
+                live_timer = gr.Timer(value=1.0, active=True)
+                live_timer.tick(
+                    fn=poll_live_encode,
+                    inputs=[live_job_id, live_rendered_playlist_url],
+                    outputs=[
+                        live_status,
+                        live_progress,
+                        live_player,
+                        live_rendered_playlist_url,
+                        live_probe_log,
+                    ],
+                )
 
     demo.launch(server_name="0.0.0.0", server_port=7860)
 

@@ -34,7 +34,18 @@ python --version  # Should show Python 3.10.x
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-## Step 4: Install Dependencies
+## Step 4: Install FFmpeg (Required for Live Streaming Tab)
+
+```bash
+# Ubuntu/Debian
+sudo apt update
+sudo apt install -y ffmpeg
+
+# Verify ffmpeg is available
+ffmpeg -version
+```
+
+## Step 5: Install Dependencies
 
 ```bash
 # Install numpy 1.26.4 (latest 1.x, required by trustmark)
@@ -50,7 +61,7 @@ pip install gradio
 pip install omegaconf>=2.1 lightning>=2.0 six>=1.9 einops>=0.4.0
 ```
 
-## Step 5: Install TrustMark Package
+## Step 6: Install TrustMark Package
 
 ```bash
 # Navigate to the python directory
@@ -60,7 +71,7 @@ cd /d/ML/__PAID__Aava/steganography/trustmark/python
 pip install -e .
 ```
 
-## Step 6: Verify Installation
+## Step 7: Verify Installation
 
 ```bash
 # Check PyTorch and CUDA
@@ -74,6 +85,9 @@ python -c "import gradio as gr; print(f'Gradio: {gr.__version__}')"
 
 # Check OpenCV
 python -c "import cv2; print(f'OpenCV: {cv2.__version__}')"
+
+# Check FFmpeg
+ffmpeg -version
 ```
 
 ### Expected Verification Output:
@@ -90,7 +104,7 @@ Gradio: 4.x.x
 OpenCV: 4.9.0
 ```
 
-## Step 7: Run the Gradio App
+## Step 8: Run the Gradio App
 
 ```bash
 # Navigate to project root
@@ -122,7 +136,7 @@ conda activate trustmark
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # Install all dependencies
-pip install numpy==1.26.4 opencv-python==4.9.0.80 gradio omegaconf lightning six einops
+pip install numpy==1.26.4 opencv-python==4.9.0.80 gradio av omegaconf lightning six einops
 
 # Install TrustMark
 cd /d/ML/__PAID__Aava/steganography/trustmark/python

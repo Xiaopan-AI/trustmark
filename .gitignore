@@ -1,3 +1,4 @@
+live_stream_output/
 __pycache__/
 *.egg-info/
 .DS_Store
