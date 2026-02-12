@@ -507,6 +507,152 @@ class TrustMark():
         return Image.fromarray(stego.astype(np.uint8))
 
     @torch.no_grad()
+    def encode_numpy(self, cover_bgr_np, string_secret, MODE='text', WM_STRENGTH=1.0, WM_MERGE='bilinear'):
+        """
+        Optimized encode function that accepts BGR numpy array directly.
+        Reduces format conversions for video processing.
+
+        Args:
+            cover_bgr_np: numpy array in BGR format (H, W, 3), uint8
+            string_secret: secret to encode
+            MODE: 'text' or 'binary'
+            WM_STRENGTH: watermark strength multiplier
+            WM_MERGE: interpolation mode for residual upscaling
+
+        Returns:
+            BGR numpy array (H, W, 3), uint8
+        """
+        # Convert BGR to RGB in numpy (faster than cv2.cvtColor)
+        cover_rgb_np = cover_bgr_np[..., ::-1].copy()
+
+        # secrets
+        if not self.use_ECC:
+            if MODE == "binary":
+                secret = [int(x) for x in string_secret]
+                secret = np.array(secret, dtype=np.float32)
+            else:
+                secret = self.ecc.encode_text_ascii(string_secret)  # bytearray
+                secret = ''.join(format(x, '08b') for x in secret)
+                secret = [int(x) for x in secret]
+                secret = np.array(secret, dtype=np.float32)
+        else:
+            if MODE == "binary":
+                secret = self.ecc.encode_binary([string_secret])
+            else:
+                secret = self.ecc.encode_text([string_secret])
+        if self.model_type == 'P':
+            WM_STRENGTH = WM_STRENGTH * 1.25
+        secret = torch.from_numpy(secret).float().to(self.device)
+
+        cover_pil = Image.fromarray(cover_rgb_np)
+        cover_image = self.get_the_image_for_processing(cover_pil)
+        w, h = cover_image.size
+        cover = cover_image.resize((self.model_resolution_enc, self.model_resolution_enc), Image.BILINEAR)
+        cover = transforms.ToTensor()(cover).unsqueeze(0).to(self.encoder.device) * 2.0 - 1.0
+        with torch.no_grad():
+            stego, _ = self.encoder(cover, secret)
+            residual = stego.clamp(-1, 1) - cover
+
+            residual_mean_c = residual.mean(dim=(2,3), keepdim=True)
+            residual = residual - residual_mean_c
+
+            residual = torch.nn.functional.interpolate(residual, size=(h, w), mode=WM_MERGE)
+            residual = residual.permute(0,2,3,1).cpu().numpy().astype('f4')
+            stego = np.clip(residual[0] * WM_STRENGTH + np.array(cover_image)/127.5-1., -1, 1)*127.5+127.5
+            stego = self.put_the_image_after_processing(stego, cover_rgb_np.astype(np.uint8))
+
+        stego_bgr = stego[..., ::-1].copy().astype(np.uint8)
+        return stego_bgr
+
+    @torch.no_grad()
+    def encode_batch_numpy(self, cover_bgr_batch, string_secret, MODE='text', WM_STRENGTH=1.0, WM_MERGE='bilinear'):
+        """
+        Batch encode multiple frames simultaneously for maximum GPU utilization.
+
+        Args:
+            cover_bgr_batch: list of numpy arrays in BGR format [(H, W, 3), ...], all same size
+            string_secret: secret to encode (same for all frames)
+            MODE: 'text' or 'binary'
+            WM_STRENGTH: watermark strength multiplier
+            WM_MERGE: interpolation mode for residual upscaling
+
+        Returns:
+            list of BGR numpy arrays [(H, W, 3), ...], uint8
+        """
+        if not cover_bgr_batch:
+            return []
+
+        batch_size = len(cover_bgr_batch)
+
+        # secrets
+        if not self.use_ECC:
+            if MODE == "binary":
+                secret = [int(x) for x in string_secret]
+                secret = np.array(secret, dtype=np.float32)
+            else:
+                secret = self.ecc.encode_text_ascii(string_secret)
+                secret = ''.join(format(x, '08b') for x in secret)
+                secret = [int(x) for x in secret]
+                secret = np.array(secret, dtype=np.float32)
+        else:
+            if MODE == "binary":
+                secret = self.ecc.encode_binary([string_secret])
+            else:
+                secret = self.ecc.encode_text([string_secret])
+
+        if self.model_type == 'P':
+            WM_STRENGTH = WM_STRENGTH * 1.25
+
+        secret_tensor = torch.from_numpy(secret).float().to(self.device)
+        if secret_tensor.ndim == 2 and secret_tensor.shape[0] == 1:
+            secret_tensor = secret_tensor[0]
+        secret_batch = secret_tensor.unsqueeze(0).repeat(batch_size, 1)
+
+        cover_tensors = []
+        original_sizes = []
+        processed_images = []
+        rgb_covers = []
+
+        for cover_bgr_np in cover_bgr_batch:
+            cover_rgb_np = cover_bgr_np[..., ::-1].copy()
+            rgb_covers.append(cover_rgb_np)
+
+            cover_pil = Image.fromarray(cover_rgb_np)
+            cover_image = self.get_the_image_for_processing(cover_pil)
+            w, h = cover_image.size
+            original_sizes.append((w, h))
+            processed_images.append(cover_image)
+
+            cover_resized = cover_image.resize((self.model_resolution_enc, self.model_resolution_enc), Image.BILINEAR)
+            cover_tensor = transforms.ToTensor()(cover_resized) * 2.0 - 1.0
+            cover_tensors.append(cover_tensor)
+
+        cover_batch = torch.stack(cover_tensors).to(self.encoder.device)
+        stego_batch, _ = self.encoder(cover_batch, secret_batch)
+        residual_batch = stego_batch.clamp(-1, 1) - cover_batch
+
+        residual_mean_c = residual_batch.mean(dim=(2,3), keepdim=True)
+        residual_batch = residual_batch - residual_mean_c
+
+        result_frames = []
+        for i in range(batch_size):
+            w, h = original_sizes[i]
+            cover_image = processed_images[i]
+
+            residual = residual_batch[i:i+1]
+            residual = torch.nn.functional.interpolate(residual, size=(h, w), mode=WM_MERGE)
+            residual = residual.permute(0,2,3,1).cpu().numpy().astype('f4')
+
+            cover_np = np.array(cover_image, dtype=np.float32) / 127.5 - 1.0
+            stego = np.clip(residual[0] * WM_STRENGTH + cover_np, -1, 1) * 127.5 + 127.5
+            stego = self.put_the_image_after_processing(stego, rgb_covers[i].astype(np.uint8))
+
+            stego_bgr = stego[..., ::-1].copy().astype(np.uint8)
+            result_frames.append(stego_bgr)
+
+        return result_frames
+
+    @torch.no_grad()
     def remove_watermark(self, in_cover_image, WM_STRENGTH=1.0, WM_MERGE='bilinear'):
 
         if self.removal is None:

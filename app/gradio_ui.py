@@ -18,6 +18,109 @@ os.environ.pop('https_proxy', None)
 logging.getLogger("PIL").setLevel(logging.WARNING)
 
 
+# ============================
+# Hardware-Accelerated Video Reading
+# ============================
+
+class HardwareVideoReader:
+    """
+    Wrapper for hardware-accelerated video decoding.
+    Falls back to CPU decoding if hardware not available.
+    """
+    def __init__(self, video_path, use_hardware=True):
+        self.video_path = video_path
+        self.use_hardware = use_hardware
+        self.reader = None
+        self.cap = None
+        self.hw_available = False
+        
+        # Try hardware-accelerated reading first
+        if use_hardware:
+            try:
+                import av
+                self.hw_available = self._init_hardware_reader()
+            except ImportError:
+                print("PyAV not installed, falling back to OpenCV CPU decoding")
+                print("Install with: pip install av")
+                self.hw_available = False
+        
+        # Fallback to OpenCV
+        if not self.hw_available:
+            self.cap = cv2.VideoCapture(video_path)
+            if not self.cap.isOpened():
+                raise ValueError(f"Cannot open video: {video_path}")
+    
+    def _init_hardware_reader(self):
+        """Initialize PyAV with hardware acceleration."""
+        try:
+            import av
+            
+            # Try to open with hardware decoding
+            container = av.open(self.video_path)
+            stream = container.streams.video[0]
+            
+            # Try hardware decoding codecs
+            hw_codecs = ['h264_cuvid', 'hevc_cuvid', 'h264_nvdec', 'hevc_nvdec']
+            
+            for codec_name in hw_codecs:
+                try:
+                    stream.codec_context.codec = codec_name
+                    self.reader = container
+                    print(f"Hardware decoding enabled: {codec_name}")
+                    return True
+                except:
+                    continue
+            
+            # Hardware failed, but PyAV still available for CPU decoding
+            self.reader = av.open(self.video_path)
+            print("Using PyAV with CPU decoding")
+            return True
+            
+        except Exception as e:
+            print(f"Hardware decode init failed: {e}")
+            return False
+    
+    def get_properties(self):
+        """Get video properties: fps, width, height."""
+        if self.hw_available and self.reader:
+            import av
+            stream = self.reader.streams.video[0]
+            fps = float(stream.average_rate)
+            width = stream.width
+            height = stream.height
+            return fps, width, height
+        else:
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            return fps, width, height
+    
+    def read_frames(self):
+        """Generator that yields frames as BGR numpy arrays."""
+        if self.hw_available and self.reader:
+            import av
+            for frame in self.reader.decode(video=0):
+                # Convert PyAV frame to numpy BGR
+                frame_rgb = frame.to_ndarray(format='rgb24')
+                frame_bgr = frame_rgb[..., ::-1].copy()
+                yield True, frame_bgr
+            yield False, None
+        else:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    yield False, None
+                    break
+                yield True, frame
+    
+    def release(self):
+        """Release video resources."""
+        if self.reader:
+            self.reader.close()
+        if self.cap:
+            self.cap.release()
+
+
 # MODEL_TYPE = "Q"  # Now dynamically selected by user
 # ============================
 # Device and Model Discovery
@@ -79,13 +182,14 @@ def encode_video_sp(video_path, wm_secret, device, model_type):
     tm = TrustMark(verbose=False, model_type=model_type, device=device)
     wm_secret = int(wm_secret)
     print(f"Encoding secret: {wm_secret}")
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
+    bits_str = "".join([str((wm_secret >> i) & 1) for i in reversed(range(56))])
+    print(f"Encoding bits: {bits_str}")
+    try:
+        video_reader = HardwareVideoReader(video_path, use_hardware=True)
+        fps, width, height = video_reader.get_properties()
+    except Exception as e:
+        print(f"Video reader initialization failed: {e}")
         return None
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     tmp_dir = tempfile.mkdtemp()
     output_path = os.path.join(tmp_dir, "encoded.mp4")
@@ -93,60 +197,121 @@ def encode_video_sp(video_path, wm_secret, device, model_type):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    while True:
-        ret, frame = cap.read()
+    for ret, frame in video_reader.read_frames():
         if not ret:
             break
 
-        pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        bits = [(wm_secret >> i) & 1 for i in reversed(range(56))]
-        # convert to string
-        bits = "".join(map(str, bits))
-        print(f"Encoding bits: {bits}")
-        wm_img = tm.encode(pil_img, bits, "binary")
-        wm_frame = cv2.cvtColor(np.array(wm_img), cv2.COLOR_RGB2BGR)
+        wm_frame = tm.encode_numpy(frame, bits_str, "binary")
         out.write(wm_frame)
 
-    cap.release()
+    video_reader.release()
     out.release()
 
     return output_path
 
 # ============================
-# 多进程编码
+# 多进程编码 (Batch-capable)
 # ============================
-def watermark_worker(in_q, out_q, bits_str, device, model_type):
+def watermark_worker_batch(in_q, out_q, bits_str, device, model_type, batch_size=8):
     """
-    独立进程：负责加载模型并进行编码
+    Batch-capable worker: collects multiple frames and processes them together.
     """
     try:
         from trustmark import TrustMark
-        # 在进程内初始化，避免 CUDA 句柄跨进程共享冲突
+        import sys
+        
+        # Initialize TrustMark with batch support
         tm_worker = TrustMark(verbose=False, model_type=model_type, device=device)
         
-        while True:
-            try:
-                item = in_q.get(timeout=5)
-                if item is None:  # 结束信号
-                    break
-                
-                frame_idx, frame_pil = item
-                # 编码
-                encoded_pil = tm_worker.encode(frame_pil, bits_str, "binary")
-                # 转换回 BGR 格式给 OpenCV
-                encoded_bgr = cv2.cvtColor(np.array(encoded_pil), cv2.COLOR_RGB2BGR)
-                
-                # 放入输出队列
-                while True:
-                    try:
-                        out_q.put((frame_idx, encoded_bgr), timeout=1)
+        # Check if batch method exists
+        if not hasattr(tm_worker, 'encode_batch_numpy'):
+            print("Warning: encode_batch_numpy not found, falling back to single-frame processing")
+            # Fallback to original worker behavior
+            while True:
+                try:
+                    item = in_q.get(timeout=5)
+                    if item is None:
                         break
-                    except Full:
-                        continue
-            except Empty:
-                continue
+                    
+                    frame_idx, frame_bgr = item
+                    # Single frame processing
+                    encoded_bgr = tm_worker.encode_numpy(frame_bgr, bits_str, "binary")
+                    
+                    while True:
+                        try:
+                            out_q.put((frame_idx, encoded_bgr), timeout=1)
+                            break
+                        except Full:
+                            continue
+                except Empty:
+                    continue
+            return
+        
+        # Batch processing mode
+        while True:
+            batch_frames = []
+            batch_indices = []
+            
+            # Collect frames for batch
+            timeout_counter = 0
+            while len(batch_frames) < batch_size and timeout_counter < 3:
+                try:
+                    item = in_q.get(timeout=0.1)
+                    if item is None:  # End signal
+                        # Process remaining batch if any
+                        if batch_frames:
+                            encoded_batch = tm_worker.encode_batch_numpy(batch_frames, bits_str, "binary")
+                            for idx, encoded_bgr in zip(batch_indices, encoded_batch):
+                                while True:
+                                    try:
+                                        out_q.put((idx, encoded_bgr), timeout=1)
+                                        break
+                                    except Full:
+                                        continue
+                        return  # Exit worker
+                    
+                    frame_idx, frame_bgr = item
+                    batch_frames.append(frame_bgr)
+                    batch_indices.append(frame_idx)
+                    
+                except Empty:
+                    timeout_counter += 1
+                    # Process partial batch if we've been waiting
+                    if len(batch_frames) > 0 and timeout_counter >= 2:
+                        break
+            
+            # Process batch if we have frames
+            if batch_frames:
+                try:
+                    encoded_batch = tm_worker.encode_batch_numpy(batch_frames, bits_str, "binary")
+                    
+                    # Put results in output queue
+                    for idx, encoded_bgr in zip(batch_indices, encoded_batch):
+                        while True:
+                            try:
+                                out_q.put((idx, encoded_bgr), timeout=1)
+                                break
+                            except Full:
+                                continue
+                except Exception as e:
+                    print(f"Batch encoding error: {e}")
+                    # Fall back to single-frame for this batch
+                    for idx, frame_bgr in zip(batch_indices, batch_frames):
+                        try:
+                            encoded_bgr = tm_worker.encode_numpy(frame_bgr, bits_str, "binary")
+                            while True:
+                                try:
+                                    out_q.put((idx, encoded_bgr), timeout=1)
+                                    break
+                                except Full:
+                                    continue
+                        except Exception as e2:
+                            print(f"Frame {idx} encoding failed: {e2}")
+                
     except Exception as e:
         print(f"Worker process error: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ============================
 # Encode Logic (Multi-process)
@@ -163,14 +328,13 @@ def encode_video(video_path, wm_secret_val, device, model_type):
     except ValueError:
         return None
 
-    # 2. 打开视频获取信息
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
+    # 2. 打开视频获取信息 (with hardware acceleration)
+    try:
+        video_reader = HardwareVideoReader(video_path, use_hardware=True)
+        fps, width, height = video_reader.get_properties()
+    except Exception as e:
+        print(f"Video reader initialization failed: {e}")
         return None
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     tmp_dir = tempfile.mkdtemp()
     output_path = os.path.join(tmp_dir, "encoded.mp4")
@@ -183,8 +347,16 @@ def encode_video(video_path, wm_secret_val, device, model_type):
     out_q = mp.Queue(maxsize=30)
     workers = []
 
+    # Batch size per worker - adjust based on GPU memory
+    if 'cuda:0' in device:
+        batch_size = 8
+    elif 'cuda:1' in device:
+        batch_size = 4
+    else:
+        batch_size = 1
+
     for _ in range(num_workers):
-        p = mp.Process(target=watermark_worker, args=(in_q, out_q, bits_str, device, model_type))
+        p = mp.Process(target=watermark_worker_batch, args=(in_q, out_q, bits_str, device, model_type, batch_size))
         p.start()
         workers.append(p)
 
@@ -196,20 +368,27 @@ def encode_video(video_path, wm_secret_val, device, model_type):
 
     print("Encoding started...")
     
+    frame_iterator = None
     try:
         while write_idx < read_idx or not all_read:
-            # 读取并放入输入队列
+            # 读取并放入输入队列 (hardware-accelerated)
             if not all_read and in_q.qsize() < 25:
-                ret, frame_bgr = cap.read()
-                if ret:
-                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    frame_pil = Image.fromarray(frame_rgb)
-                    try:
-                        in_q.put_nowait((read_idx, frame_pil))
-                        read_idx += 1
-                    except Full:
-                        pass
-                else:
+                if frame_iterator is None:
+                    frame_iterator = video_reader.read_frames()
+
+                try:
+                    ret, frame_bgr = next(frame_iterator)
+                    if ret:
+                        try:
+                            in_q.put_nowait((read_idx, frame_bgr))
+                            read_idx += 1
+                        except Full:
+                            pass
+                    else:
+                        all_read = True
+                        for _ in range(num_workers):
+                            in_q.put(None) # 发送停止信号
+                except StopIteration:
                     all_read = True
                     for _ in range(num_workers):
                         in_q.put(None) # 发送停止信号
@@ -227,7 +406,7 @@ def encode_video(video_path, wm_secret_val, device, model_type):
                 writer.write(buffer.pop(write_idx))
                 write_idx += 1
     finally:
-        cap.release()
+        video_reader.release()
         writer.release()
         for p in workers:
             p.join(timeout=2)
