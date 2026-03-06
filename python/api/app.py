@@ -15,11 +15,12 @@ logger.add(
 logger.info("Initializing FastAPI watermark API module")
 
 from python.api.lib.encode_runtime import registry
-from python.api.routes import decode_router, encode_router
+from python.api.routes import action_router, decode_router, encode_router
 
 app = FastAPI(title="Watermarking Live Encode MVP")
 app.include_router(encode_router)
 app.include_router(decode_router)
+app.include_router(action_router)
 atexit.register(registry.cleanup_all)
 
 logger.info("FastAPI app created title='{}'", app.title)

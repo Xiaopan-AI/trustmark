@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import AnyHttpUrl, BaseModel, Field
 
@@ -20,6 +20,8 @@ class SessionStateEnum(str, Enum):
     PREPARED = "prepared"
     BUFFERING = "buffering"
     STREAMING = "streaming"
+    PAUSED = "paused"
+    INVALIDATED = "invalidated"
     DONE = "done"
     ERROR = "error"
 
@@ -43,7 +45,11 @@ class CreateStreamResponse(BaseModel):
     stream_url: str
     player_url: str
     status_url: str
+    play_url: str
+    pause_url: str
+    resume_url: str
     seek_url: str
+    heartbeat_url: str
     state: SessionStateEnum
     duration_seconds: float
     fps: float
@@ -60,8 +66,38 @@ class CreateStreamResponse(BaseModel):
     encoder_backend: str
 
 
+class PlaybackControlRequest(BaseModel):
+    position_seconds: Optional[float] = Field(default=None, ge=0.0)
+    client_generation: Optional[int] = Field(default=None, ge=0)
+
+
 class SeekRequest(BaseModel):
     time_seconds: float = Field(..., ge=0.0)
+
+
+class HeartbeatRequest(BaseModel):
+    position_seconds: float = Field(..., ge=0.0)
+
+
+class PlaybackControlResponse(BaseModel):
+    stream_id: str
+    state: SessionStateEnum
+    generation: int
+    logical_position_seconds: float
+    anchor_time_seconds: float
+    ready_for_playback: bool
+    playlist_url: str
+    status_url: str
+
+
+class InvalidateSessionRequest(BaseModel):
+    wm_secret: int = Field(..., ge=0, le=(1 << 56) - 1)
+
+
+class InvalidateSessionResponse(BaseModel):
+    wm_secret: int
+    invalidated_count: int
+    invalidated_stream_ids: list[str]
 
 
 class DecodeFrameResponse(BaseModel):
