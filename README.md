@@ -52,6 +52,17 @@ pip install .
 To get started quickly, run the `python/test.py` script that provides examples of watermarking several 
 image files from the `images` directory. 
 
+## FastAPI Backend
+
+To start the FastAPI backend from the repository root, run:
+
+```sh
+uvicorn python.api.app:app --host 0.0.0.0 --port 8000
+```
+
+The FastAPI entrypoint is `python/api/app.py`.
+For the API-specific usage notes and routes, see `python/api/README.md`.
+
 ### Run the example
 
 Run the example as follows:
